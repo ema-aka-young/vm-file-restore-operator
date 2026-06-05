@@ -2,12 +2,16 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	v1 "kubevirt.io/api/core/v1"
 	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -15,6 +19,17 @@ import (
 
 	restorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
 )
+
+// NewSubresourceRESTClient creates a REST client for the KubeVirt subresource API
+// (subresources.kubevirt.io/v1). Used for addvolume/removevolume calls that work
+// with both HotplugVolumes and DeclarativeHotplugVolumes feature gates.
+func NewSubresourceRESTClient(cfg *rest.Config) (rest.Interface, error) {
+	restCfg := rest.CopyConfig(cfg)
+	restCfg.GroupVersion = &schema.GroupVersion{Group: "subresources.kubevirt.io", Version: "v1"}
+	restCfg.APIPath = "/apis"
+	restCfg.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	return rest.RESTClientFor(restCfg)
+}
 
 // GetVolumeName returns the volume name for a given restore CR name.
 // The volume name is used as the volume name, disk name, and serial number for guest OS detection.
@@ -26,10 +41,10 @@ func GetVolumeName(crName string) string {
 	return crName + "-restore"
 }
 
-// HotplugVolume hotplugs a restore volume to the target VM.
-// It handles PVC and snapshot sources, creating temporary PVCs for snapshots.
+// HotplugVolume hotplugs a restore volume to the target VM using the KubeVirt subresource API.
+// This works with both HotplugVolumes and DeclarativeHotplugVolumes feature gates.
 // apiReader is a non-cached reader used to read DataVolume status immediately after creation.
-func HotplugVolume(ctx context.Context, c client.Client, apiReader client.Reader, vmfr *restorev1alpha1.VirtualMachineFileRestore, vm *v1.VirtualMachine) error {
+func HotplugVolume(ctx context.Context, c client.Client, apiReader client.Reader, subresourceClient rest.Interface, vmfr *restorev1alpha1.VirtualMachineFileRestore, vm *v1.VirtualMachine) error {
 	logger := log.FromContext(ctx)
 	volumeName := GetVolumeName(vmfr.Name)
 
@@ -153,68 +168,69 @@ func HotplugVolume(ctx context.Context, c client.Client, apiReader client.Reader
 		return fmt.Errorf("no valid source specified")
 	}
 
-	// Create volume
-	volume := v1.Volume{
-		Name:         volumeName,
-		VolumeSource: volumeSource,
-	}
-
-	// Create disk with SCSI bus and serial number for guest detection
-	disk := v1.Disk{
+	addVolumeOpts := &v1.AddVolumeOptions{
 		Name: volumeName,
-		DiskDevice: v1.DiskDevice{
-			Disk: &v1.DiskTarget{
-				Bus:      v1.DiskBusSCSI,
-				ReadOnly: false,
+		Disk: &v1.Disk{
+			Name: volumeName,
+			DiskDevice: v1.DiskDevice{
+				Disk: &v1.DiskTarget{
+					Bus: v1.DiskBusSCSI,
+				},
 			},
+			Serial: volumeName,
 		},
-		Serial: volumeName,
+		VolumeSource: &v1.HotplugVolumeSource{
+			PersistentVolumeClaim: volumeSource.PersistentVolumeClaim,
+		},
 	}
 
-	// Use Patch instead of Update to avoid conflicts from concurrent VM modifications
-	patch := client.MergeFrom(vm.DeepCopy())
+	body, err := json.Marshal(addVolumeOpts)
+	if err != nil {
+		return fmt.Errorf("marshal AddVolumeOptions: %w", err)
+	}
 
-	// Append volume and disk to VM
-	vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, volume)
-	vm.Spec.Template.Spec.Domain.Devices.Disks = append(vm.Spec.Template.Spec.Domain.Devices.Disks, disk)
-
-	// Patch VM (safer than Update, avoids conflicts)
-	if err := c.Patch(ctx, vm, patch); err != nil {
-		return fmt.Errorf("failed to hotplug volume to VM: %w", err)
+	if err := subresourceClient.Put().
+		Namespace(vmfr.Namespace).
+		Resource("virtualmachines").
+		Name(vm.Name).
+		SubResource("addvolume").
+		Body(body).
+		Do(ctx).
+		Error(); err != nil {
+		if errors.IsConflict(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to hotplug volume via subresource API: %w", err)
 	}
 
 	return nil
 }
 
-// UnplugVolume removes the restore volume from the target VM.
-// It also cleans up temporary PVCs created for snapshot sources.
-func UnplugVolume(ctx context.Context, c client.Client, vmfr *restorev1alpha1.VirtualMachineFileRestore, vm *v1.VirtualMachine) error {
+// UnplugVolume removes the restore volume from the target VM using the KubeVirt subresource API.
+// It also cleans up temporary DataVolumes created for snapshot sources.
+func UnplugVolume(ctx context.Context, c client.Client, subresourceClient rest.Interface, vmfr *restorev1alpha1.VirtualMachineFileRestore, vm *v1.VirtualMachine) error {
 	volumeName := GetVolumeName(vmfr.Name)
 
-	// Use Patch instead of Update to avoid conflicts from concurrent VM modifications
-	patch := client.MergeFrom(vm.DeepCopy())
-
-	// Filter out the restore volume
-	filteredVolumes := []v1.Volume{}
-	for _, vol := range vm.Spec.Template.Spec.Volumes {
-		if vol.Name != volumeName {
-			filteredVolumes = append(filteredVolumes, vol)
-		}
+	removeVolumeOpts := &v1.RemoveVolumeOptions{
+		Name: volumeName,
 	}
-	vm.Spec.Template.Spec.Volumes = filteredVolumes
 
-	// Filter out the restore disk
-	filteredDisks := []v1.Disk{}
-	for _, disk := range vm.Spec.Template.Spec.Domain.Devices.Disks {
-		if disk.Name != volumeName {
-			filteredDisks = append(filteredDisks, disk)
-		}
+	body, err := json.Marshal(removeVolumeOpts)
+	if err != nil {
+		return fmt.Errorf("marshal RemoveVolumeOptions: %w", err)
 	}
-	vm.Spec.Template.Spec.Domain.Devices.Disks = filteredDisks
 
-	// Patch VM (safer than Update, avoids conflicts)
-	if err := c.Patch(ctx, vm, patch); err != nil {
-		return fmt.Errorf("failed to unplug volume from VM: %w", err)
+	if err := subresourceClient.Put().
+		Namespace(vmfr.Namespace).
+		Resource("virtualmachines").
+		Name(vm.Name).
+		SubResource("removevolume").
+		Body(body).
+		Do(ctx).
+		Error(); err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to unplug volume via subresource API: %w", err)
+		}
 	}
 
 	// If snapshot source, delete DataVolume (which will delete the PVC)

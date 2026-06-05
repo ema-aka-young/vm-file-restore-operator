@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	v1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,6 +44,7 @@ const (
 type VirtualMachineFileRestoreReconciler struct {
 	client.Client
 	APIReader         client.Reader
+	SubresourceClient rest.Interface
 	Scheme            *runtime.Scheme
 	Recorder          record.EventRecorder
 	OperatorNamespace string
@@ -53,6 +55,8 @@ type VirtualMachineFileRestoreReconciler struct {
 // +kubebuilder:rbac:groups=filerestore.kubevirt.io,resources=virtualmachinefilerestores/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
+// +kubebuilder:rbac:groups=subresources.kubevirt.io,resources=virtualmachines/addvolume,verbs=update
+// +kubebuilder:rbac:groups=subresources.kubevirt.io,resources=virtualmachines/removevolume,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;delete
@@ -211,7 +215,7 @@ func (r *VirtualMachineFileRestoreReconciler) cleanup(ctx context.Context, vmfr 
 		Namespace: vmfr.Namespace,
 	}, vm)
 	if err == nil {
-		_ = UnplugVolume(ctx, r.Client, vmfr, vm)
+		_ = UnplugVolume(ctx, r.Client, r.SubresourceClient, vmfr, vm)
 	}
 
 	return nil

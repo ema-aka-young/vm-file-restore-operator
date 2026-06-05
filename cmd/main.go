@@ -242,9 +242,16 @@ func main() {
 	}
 	setupLog.Info("SSH keypair ready")
 
+	subresourceClient, err := controller.NewSubresourceRESTClient(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create KubeVirt subresource REST client")
+		os.Exit(1)
+	}
+
 	if err := (&controller.VirtualMachineFileRestoreReconciler{
 		Client:            mgr.GetClient(),
 		APIReader:         mgr.GetAPIReader(),
+		SubresourceClient: subresourceClient,
 		Scheme:            mgr.GetScheme(),
 		OperatorNamespace: operatorNamespace,
 	}).SetupWithManager(mgr); err != nil {
