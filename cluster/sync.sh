@@ -10,11 +10,13 @@ if [ -z "${KUBECONFIG}" ]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [ -z "${IMG:-}" ] || [ -z "${PUSH_IMG:-}" ]; then
+if [ -z "${IMG:-}" ] && [ -z "${PUSH_IMG:-}" ]; then
     # shellcheck source=../hack/kubevirtci-image-env.sh
     source "${repo_root}/hack/kubevirtci-image-env.sh"
-else
-    : "${PUSH_IMG:=${IMG}}"
+elif [ -z "${PUSH_IMG:-}" ]; then
+    export PUSH_IMG="${IMG}"
+elif [ -z "${IMG:-}" ]; then
+    export IMG="${PUSH_IMG}"
 fi
 
 echo "Deploying operator with image: ${IMG}"

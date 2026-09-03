@@ -351,7 +351,8 @@ is manually re-applied afterwards.
 
 ### Unit Tests
 
-Run unit tests:
+Runs Go unit tests and containerized guest-helper script tests (requires docker or podman):
+
 ```bash
 make test
 ```
@@ -394,7 +395,9 @@ are read from `kubevirtci/_ci-configs/<provider>/config-provider-*.sh` after
 Set both explicitly to use an external registry instead:
 
 ```bash
-PUSH_IMG=<url-your-machine-pushes-to> IMG=<url-cluster-nodes-pull-from> make cluster-sync
+PUSH_IMG=registry.example.com/kubevirt/vm-file-restore-operator:example-tag \
+IMG=registry:5000/kubevirt/vm-file-restore-operator:example-tag \
+make cluster-sync
 ```
 
 #### Run the full suite locally
@@ -421,7 +424,8 @@ without recreating the cluster.
 ```bash
 make cluster-up
 
-export KUBECONFIG="$(source hack/config.sh && ./kubevirtci/cluster-up/kubeconfig.sh)"
+kubeconfig="$(source hack/config.sh && ./kubevirtci/cluster-up/kubeconfig.sh)"
+export KUBECONFIG="${kubeconfig}"
 kubectl get nodes
 
 make cluster-sync
@@ -449,7 +453,7 @@ Default test timeout is `90m` (`E2E_TIMEOUT`).
 Prow job `pull-vm-file-restore-operator-e2e` runs `./hack/test-e2e.sh` on bare-metal
 workers. The job is optional and not run on every PR; trigger it with:
 
-```
+```text
 /test pull-vm-file-restore-operator-e2e
 ```
 

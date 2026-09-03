@@ -23,7 +23,7 @@ if [ ! -f "${provider_config}" ]; then
 fi
 
 # shellcheck source=../kubevirtci/cluster-up/hack/config.sh
-source "${KUBEVIRTCI_PATH}hack/config.sh"
+source "${KUBEVIRTCI_PATH%/}/hack/config.sh"
 
 image_name="vm-file-restore-operator"
 image_tag="${IMAGE_TAG:-dev-$(git -C "${REPO_ROOT}" rev-parse --short HEAD)}"
