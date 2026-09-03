@@ -22,7 +22,7 @@ if [ "${PUSH_IMG}" != "${IMG}" ]; then
     echo "Pushing image as: ${PUSH_IMG}"
 fi
 
-if [ "${SKIP_IMAGE_BUILD}" = "true" ]; then
+if [ "${SKIP_IMAGE_BUILD:-}" = "true" ]; then
     echo "Skipping image build (SKIP_IMAGE_BUILD=true)"
     make build-installer IMG="${IMG}"
 else

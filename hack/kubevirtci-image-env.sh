@@ -4,7 +4,7 @@
 # Host pushes to docker_prefix (localhost:<port>/kubevirt); the cluster pulls
 # manifest_docker_prefix (registry:5000/kubevirt).
 
-set -euo pipefail
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=config.sh
@@ -35,5 +35,5 @@ if [ -z "${IMG:-}" ]; then
 	export IMG="${manifest_docker_prefix}/${image_name}:${image_tag}"
 fi
 
-echo "Using PUSH_IMG=${PUSH_IMG}"
-echo "Using IMG=${IMG}"
+echo "Using PUSH_IMG=${PUSH_IMG}" >&2
+echo "Using IMG=${IMG}" >&2
