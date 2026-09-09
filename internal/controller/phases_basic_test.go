@@ -1,11 +1,15 @@
 package controller
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	v1 "kubevirt.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	restorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
 )
@@ -69,6 +73,149 @@ func TestParseRestoredFileCount(t *testing.T) {
 			assert.Equal(t, tt.expected, ParseRestoredFileCount(tt.stdout))
 		})
 	}
+}
+
+func TestIsRestoringPhaseCurrent(t *testing.T) {
+	assert.True(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseRestoring))
+	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseCleanup))
+	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseSucceeded))
+	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseVolumeReady))
+}
+
+// TestCopyRestoredFilesCountIfMissing verifies count is copied when dst is nil and not overwritten.
+func TestCopyRestoredFilesCountIfMissing(t *testing.T) {
+	int32Ptr := func(value int32) *int32 { return &value }
+
+	tests := []struct {
+		name     string
+		dstCount *int32
+		srcCount *int32
+		want     *int32
+	}{
+		{
+			name:     "copies when dst is nil",
+			dstCount: nil,
+			srcCount: int32Ptr(3),
+			want:     int32Ptr(3),
+		},
+		{
+			name:     "does not overwrite existing dst count",
+			dstCount: int32Ptr(7),
+			srcCount: int32Ptr(3),
+			want:     int32Ptr(7),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			dst := &restorev1alpha1.VirtualMachineFileRestore{
+				Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+					RestoredFilesCount: testCase.dstCount,
+				},
+			}
+			src := &restorev1alpha1.VirtualMachineFileRestore{
+				Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+					RestoredFilesCount: testCase.srcCount,
+				},
+			}
+			copyRestoredFilesCountIfMissing(dst, src)
+			require.NotNil(t, dst.Status.RestoredFilesCount)
+			assert.Equal(t, *testCase.want, *dst.Status.RestoredFilesCount)
+			if testCase.dstCount == nil {
+				assert.NotSame(t, src.Status.RestoredFilesCount, dst.Status.RestoredFilesCount)
+			}
+		})
+	}
+}
+
+func TestPreserveRestoredFilesCount(t *testing.T) {
+	int32Ptr := func(value int32) *int32 { return &value }
+	scheme := runtime.NewScheme()
+	require.NoError(t, restorev1alpha1.AddToScheme(scheme))
+	ctx := context.Background()
+
+	t.Run("count already set", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-1", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				RestoredFilesCount: int32Ptr(5),
+			},
+		}
+		latest := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-1", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				RestoredFilesCount: int32Ptr(3),
+			},
+		}
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+		}
+		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		assert.Equal(t, int32(5), *vmfr.Status.RestoredFilesCount)
+	})
+
+	t.Run("copies count from API", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-2", Namespace: "test-ns"},
+		}
+		latest := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-2", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				RestoredFilesCount: int32Ptr(4),
+			},
+		}
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+		}
+		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NotNil(t, vmfr.Status.RestoredFilesCount)
+		assert.Equal(t, int32(4), *vmfr.Status.RestoredFilesCount)
+	})
+
+	t.Run("API miss leaves count nil", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "missing", Namespace: "test-ns"},
+		}
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		}
+		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		assert.Nil(t, vmfr.Status.RestoredFilesCount)
+	})
+
+	t.Run("falls back to cached client", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-3", Namespace: "test-ns"},
+		}
+		latest := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-3", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				RestoredFilesCount: int32Ptr(2),
+			},
+		}
+		cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build()
+		reconciler := &VirtualMachineFileRestoreReconciler{Client: cachedClient}
+		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NotNil(t, vmfr.Status.RestoredFilesCount)
+		assert.Equal(t, int32(2), *vmfr.Status.RestoredFilesCount)
+	})
+}
+
+func TestReconcilerAPIReader(t *testing.T) {
+	cachedClient := fake.NewClientBuilder().Build()
+	apiReader := fake.NewClientBuilder().Build()
+	reconciler := &VirtualMachineFileRestoreReconciler{Client: cachedClient, APIReader: apiReader}
+	reader, usingCache := reconcilerAPIReader(reconciler)
+	assert.Equal(t, apiReader, reader)
+	assert.False(t, usingCache)
+
+	reconciler = &VirtualMachineFileRestoreReconciler{Client: cachedClient}
+	reader, usingCache = reconcilerAPIReader(reconciler)
+	assert.Equal(t, cachedClient, reader)
+	assert.True(t, usingCache)
 }
 
 // Test transitionPhase timestamp logic - verifies StartTime/CompletionTime behavior

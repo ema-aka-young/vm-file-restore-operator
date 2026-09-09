@@ -161,6 +161,83 @@ func incrementRetryAndRequeue(ctx context.Context, r *VirtualMachineFileRestoreR
 	return ctrl.Result{RequeueAfter: delay}, nil
 }
 
+// preserveRestoredFilesCount fetches the latest API object and copies RestoredFilesCount
+// into vmfr when vmfr's count is nil. Merge patches during Cleanup requeues can leave a
+// stale in-memory copy without the count. Logs and returns on API errors. Uses APIReader
+// when configured; otherwise falls back to the cached client.
+func preserveRestoredFilesCount(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) {
+	logger := log.FromContext(ctx)
+	if vmfr.Status.RestoredFilesCount != nil {
+		return
+	}
+	reader, usingCache := reconcilerAPIReader(r)
+	if usingCache {
+		logger.Info("APIReader not configured; using cached client to preserve restoredFilesCount")
+	}
+	latest := &restorev1alpha1.VirtualMachineFileRestore{}
+	key := client.ObjectKeyFromObject(vmfr)
+	if err := reader.Get(ctx, key, latest); err != nil {
+		logger.Error(err, "preserveRestoredFilesCount: failed to fetch latest resource, count will be lost", "key", key)
+		return
+	}
+	copyRestoredFilesCountIfMissing(vmfr, latest)
+}
+
+// copyRestoredFilesCountIfMissing copies RestoredFilesCount from src to dst when dst's count is nil.
+// Copies the pointed-to value to avoid pointer aliasing with the API object.
+func copyRestoredFilesCountIfMissing(dst, src *restorev1alpha1.VirtualMachineFileRestore) {
+	if dst.Status.RestoredFilesCount != nil {
+		return
+	}
+	if src.Status.RestoredFilesCount != nil {
+		count := *src.Status.RestoredFilesCount
+		dst.Status.RestoredFilesCount = &count
+	}
+}
+
+// reconcilerAPIReader returns the uncached reader when configured, otherwise the cached client.
+// The second return value is true when falling back to the cached client.
+func reconcilerAPIReader(r *VirtualMachineFileRestoreReconciler) (client.Reader, bool) {
+	if r.APIReader != nil {
+		return r.APIReader, false
+	}
+	return r.Client, true
+}
+
+// isRestoringPhaseCurrent reports whether the API phase still requires running the restore command.
+func isRestoringPhaseCurrent(apiPhase restorev1alpha1.RestorePhase) bool {
+	return apiPhase == restorev1alpha1.RestorePhaseRestoring
+}
+
+// skipRestoringIfPhaseAdvanced checks the uncached API phase before SSH restore.
+// Returns true when a stale reconcile should not re-run the restore command.
+func skipRestoringIfPhaseAdvanced(
+	ctx context.Context,
+	r *VirtualMachineFileRestoreReconciler,
+	vmfr *restorev1alpha1.VirtualMachineFileRestore,
+) (bool, ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	reader, usingCache := reconcilerAPIReader(r)
+	if usingCache {
+		logger.Info("APIReader not configured; using cached client to check restore phase")
+	}
+	latest := &restorev1alpha1.VirtualMachineFileRestore{}
+	key := client.ObjectKeyFromObject(vmfr)
+	if err := reader.Get(ctx, key, latest); err != nil {
+		logger.Error(err, "Failed to fetch latest VirtualMachineFileRestore before restore command")
+		return false, ctrl.Result{}, nil
+	}
+	if isRestoringPhaseCurrent(latest.Status.Phase) {
+		return false, ctrl.Result{}, nil
+	}
+	logger.Info(
+		"Skipping restore command; API phase already advanced",
+		"cachedPhase", vmfr.Status.Phase,
+		"apiPhase", latest.Status.Phase,
+	)
+	return true, ctrl.Result{}, nil
+}
+
 // failRestore transitions the restore to Failed phase with error details.
 func failRestore(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore, err error, detail string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -537,6 +614,10 @@ func handleSSHConnectingPhase(ctx context.Context, r *VirtualMachineFileRestoreR
 func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	if skip, result, err := skipRestoringIfPhaseAdvanced(ctx, r, vmfr); err != nil || skip {
+		return result, err
+	}
+
 	// Get VMI
 	vmi := &v1.VirtualMachineInstance{}
 	vmiKey := client.ObjectKey{
@@ -627,7 +708,9 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 	logger.Info("Phase transition", "oldPhase", restorev1alpha1.RestorePhaseRestoring,
 		"newPhase", nextPhase)
 
-	return ctrl.Result{Requeue: true}, nil
+	// Status patch triggers the next reconcile for Cleanup/VolumeReady; do not Requeue here
+	// or a stale cache read can re-enter Restoring and run the restore command twice.
+	return ctrl.Result{}, nil
 }
 
 // handleVolumeReadyPhase handles manual restore mode - volume is mounted, waiting for user.
@@ -644,6 +727,9 @@ func handleVolumeReadyPhase(ctx context.Context, r *VirtualMachineFileRestoreRec
 // handleCleanupPhase unplugs the volume and transitions to Succeeded.
 func handleCleanupPhase(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Refresh restoredFilesCount before any branch that depends on it (normal unplug or VM deleted).
+	preserveRestoredFilesCount(ctx, r, vmfr)
 
 	// Get target VM
 	vm := &v1.VirtualMachine{}
@@ -700,12 +786,11 @@ func handleCleanupPhase(ctx context.Context, r *VirtualMachineFileRestoreReconci
 	// Record event
 	r.Recorder.Event(vmfr, corev1.EventTypeNormal, "VolumeUnplugged", "Volume unplugged from VM")
 
-	// Transition to Succeeded
-	var filesRestored int32
+	message := "Restore completed successfully"
 	if vmfr.Status.RestoredFilesCount != nil {
-		filesRestored = *vmfr.Status.RestoredFilesCount
+		message = fmt.Sprintf("Restore completed successfully (%d files)", *vmfr.Status.RestoredFilesCount)
 	}
-	return transitionPhase(ctx, r, vmfr, restorev1alpha1.RestorePhaseSucceeded, fmt.Sprintf("Restore completed successfully (%d files)", filesRestored))
+	return transitionPhase(ctx, r, vmfr, restorev1alpha1.RestorePhaseSucceeded, message)
 }
 
 // ParseRestoredFileCount extracts a file count from guest helper stdout.
