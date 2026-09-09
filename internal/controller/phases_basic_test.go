@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,7 +10,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	v1 "kubevirt.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	restorev1alpha1 "kubevirt.io/vm-file-restore-operator/api/v1alpha1"
 )
@@ -104,6 +107,12 @@ func TestCopyRestoredFilesCountIfMissing(t *testing.T) {
 			srcCount: int32Ptr(3),
 			want:     int32Ptr(7),
 		},
+		{
+			name:     "leaves dst nil when src count is nil",
+			dstCount: nil,
+			srcCount: nil,
+			want:     nil,
+		},
 	}
 
 	for _, testCase := range tests {
@@ -119,6 +128,10 @@ func TestCopyRestoredFilesCountIfMissing(t *testing.T) {
 				},
 			}
 			copyRestoredFilesCountIfMissing(dst, src)
+			if testCase.want == nil {
+				assert.Nil(t, dst.Status.RestoredFilesCount)
+				return
+			}
 			require.NotNil(t, dst.Status.RestoredFilesCount)
 			assert.Equal(t, *testCase.want, *dst.Status.RestoredFilesCount)
 			if testCase.dstCount == nil {
@@ -151,7 +164,8 @@ func TestPreserveRestoredFilesCount(t *testing.T) {
 			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
 			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
 		}
-		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		err := preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NoError(t, err)
 		assert.Equal(t, int32(5), *vmfr.Status.RestoredFilesCount)
 	})
 
@@ -169,7 +183,8 @@ func TestPreserveRestoredFilesCount(t *testing.T) {
 			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
 			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
 		}
-		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		err := preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NoError(t, err)
 		require.NotNil(t, vmfr.Status.RestoredFilesCount)
 		assert.Equal(t, int32(4), *vmfr.Status.RestoredFilesCount)
 	})
@@ -182,7 +197,8 @@ func TestPreserveRestoredFilesCount(t *testing.T) {
 			Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
 			APIReader: fake.NewClientBuilder().WithScheme(scheme).Build(),
 		}
-		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		err := preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NoError(t, err)
 		assert.Nil(t, vmfr.Status.RestoredFilesCount)
 	})
 
@@ -198,10 +214,69 @@ func TestPreserveRestoredFilesCount(t *testing.T) {
 		}
 		cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build()
 		reconciler := &VirtualMachineFileRestoreReconciler{Client: cachedClient}
-		preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		err := preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.NoError(t, err)
 		require.NotNil(t, vmfr.Status.RestoredFilesCount)
 		assert.Equal(t, int32(2), *vmfr.Status.RestoredFilesCount)
 	})
+
+	t.Run("API reader failure returns transient error", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-api-fail", Namespace: "test-ns"},
+		}
+		boom := errors.New("apiserver unavailable")
+		failingReader := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+					if _, ok := obj.(*restorev1alpha1.VirtualMachineFileRestore); ok {
+						return boom
+					}
+					return nil
+				},
+			}).Build()
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+			APIReader: failingReader,
+		}
+		err := preserveRestoredFilesCount(ctx, reconciler, vmfr)
+		require.Error(t, err)
+		assert.True(t, IsTransient(err))
+		assert.Contains(t, err.Error(), "preserveRestoredFilesCount")
+		assert.Nil(t, vmfr.Status.RestoredFilesCount)
+	})
+}
+
+func TestSkipRestoringIfPhaseAdvanced_APIReaderFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, restorev1alpha1.AddToScheme(scheme))
+	ctx := context.Background()
+
+	vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "restore-skip-fail", Namespace: "test-ns"},
+		Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+			Phase: restorev1alpha1.RestorePhaseRestoring,
+		},
+	}
+	boom := errors.New("apiserver unavailable")
+	failingReader := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+				if _, ok := obj.(*restorev1alpha1.VirtualMachineFileRestore); ok {
+					return boom
+				}
+				return nil
+			},
+		}).Build()
+	reconciler := &VirtualMachineFileRestoreReconciler{
+		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+		APIReader: failingReader,
+	}
+
+	skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
+	require.Error(t, err)
+	assert.False(t, skip)
+	assert.True(t, IsTransient(err))
+	assert.Contains(t, err.Error(), "before restore command")
 }
 
 func TestReconcilerAPIReader(t *testing.T) {

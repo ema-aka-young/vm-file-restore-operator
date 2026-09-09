@@ -163,12 +163,12 @@ func incrementRetryAndRequeue(ctx context.Context, r *VirtualMachineFileRestoreR
 
 // preserveRestoredFilesCount fetches the latest API object and copies RestoredFilesCount
 // into vmfr when vmfr's count is nil. Merge patches during Cleanup requeues can leave a
-// stale in-memory copy without the count. Logs and returns on API errors. Uses APIReader
-// when configured; otherwise falls back to the cached client.
-func preserveRestoredFilesCount(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) {
+// stale in-memory copy without the count. Returns a retryable TransientError when the API
+// read fails. Uses APIReader when configured; otherwise falls back to the cached client.
+func preserveRestoredFilesCount(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) error {
 	logger := log.FromContext(ctx)
 	if vmfr.Status.RestoredFilesCount != nil {
-		return
+		return nil
 	}
 	reader, usingCache := reconcilerAPIReader(r)
 	if usingCache {
@@ -177,10 +177,14 @@ func preserveRestoredFilesCount(ctx context.Context, r *VirtualMachineFileRestor
 	latest := &restorev1alpha1.VirtualMachineFileRestore{}
 	key := client.ObjectKeyFromObject(vmfr)
 	if err := reader.Get(ctx, key, latest); err != nil {
-		logger.Error(err, "preserveRestoredFilesCount: failed to fetch latest resource, count will be lost", "key", key)
-		return
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		logger.Error(err, "preserveRestoredFilesCount: failed to fetch latest resource", "key", key)
+		return NewTransientError(fmt.Sprintf("preserveRestoredFilesCount: failed to fetch latest VirtualMachineFileRestore %s: %v", key, err))
 	}
 	copyRestoredFilesCountIfMissing(vmfr, latest)
+	return nil
 }
 
 // copyRestoredFilesCountIfMissing copies RestoredFilesCount from src to dst when dst's count is nil.
@@ -215,7 +219,7 @@ func skipRestoringIfPhaseAdvanced(
 	ctx context.Context,
 	r *VirtualMachineFileRestoreReconciler,
 	vmfr *restorev1alpha1.VirtualMachineFileRestore,
-) (bool, ctrl.Result, error) {
+) (bool, error) {
 	logger := log.FromContext(ctx)
 	reader, usingCache := reconcilerAPIReader(r)
 	if usingCache {
@@ -224,18 +228,18 @@ func skipRestoringIfPhaseAdvanced(
 	latest := &restorev1alpha1.VirtualMachineFileRestore{}
 	key := client.ObjectKeyFromObject(vmfr)
 	if err := reader.Get(ctx, key, latest); err != nil {
-		logger.Error(err, "Failed to fetch latest VirtualMachineFileRestore before restore command")
-		return false, ctrl.Result{}, nil
+		logger.Error(err, "Failed to fetch latest VirtualMachineFileRestore before restore command", "key", key)
+		return false, NewTransientError(fmt.Sprintf("failed to fetch latest VirtualMachineFileRestore %s before restore command: %v", key, err))
 	}
 	if isRestoringPhaseCurrent(latest.Status.Phase) {
-		return false, ctrl.Result{}, nil
+		return false, nil
 	}
 	logger.Info(
 		"Skipping restore command; API phase already advanced",
 		"cachedPhase", vmfr.Status.Phase,
 		"apiPhase", latest.Status.Phase,
 	)
-	return true, ctrl.Result{}, nil
+	return true, nil
 }
 
 // failRestore transitions the restore to Failed phase with error details.
@@ -614,8 +618,12 @@ func handleSSHConnectingPhase(ctx context.Context, r *VirtualMachineFileRestoreR
 func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreReconciler, vmfr *restorev1alpha1.VirtualMachineFileRestore) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if skip, result, err := skipRestoringIfPhaseAdvanced(ctx, r, vmfr); err != nil || skip {
-		return result, err
+	skip, err := skipRestoringIfPhaseAdvanced(ctx, r, vmfr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if skip {
+		return ctrl.Result{}, nil
 	}
 
 	// Get VMI
@@ -729,7 +737,9 @@ func handleCleanupPhase(ctx context.Context, r *VirtualMachineFileRestoreReconci
 	logger := log.FromContext(ctx)
 
 	// Refresh restoredFilesCount before any branch that depends on it (normal unplug or VM deleted).
-	preserveRestoredFilesCount(ctx, r, vmfr)
+	if err := preserveRestoredFilesCount(ctx, r, vmfr); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Get target VM
 	vm := &v1.VirtualMachine{}
