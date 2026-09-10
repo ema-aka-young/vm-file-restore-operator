@@ -170,8 +170,9 @@ func preserveRestoredFilesCount(ctx context.Context, r *VirtualMachineFileRestor
 	if vmfr.Status.RestoredFilesCount != nil {
 		return nil
 	}
-	reader, usingCache := reconcilerAPIReader(r)
-	if usingCache {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
 		logger.Info("APIReader not configured; using cached client to preserve restoredFilesCount")
 	}
 	latest := &restorev1alpha1.VirtualMachineFileRestore{}
@@ -199,20 +200,6 @@ func copyRestoredFilesCountIfMissing(dst, src *restorev1alpha1.VirtualMachineFil
 	}
 }
 
-// reconcilerAPIReader returns the uncached reader when configured, otherwise the cached client.
-// The second return value is true when falling back to the cached client.
-func reconcilerAPIReader(r *VirtualMachineFileRestoreReconciler) (client.Reader, bool) {
-	if r.APIReader != nil {
-		return r.APIReader, false
-	}
-	return r.Client, true
-}
-
-// isRestoringPhaseCurrent reports whether the API phase still requires running the restore command.
-func isRestoringPhaseCurrent(apiPhase restorev1alpha1.RestorePhase) bool {
-	return apiPhase == restorev1alpha1.RestorePhaseRestoring
-}
-
 // skipRestoringIfPhaseAdvanced checks the uncached API phase before SSH restore.
 // Returns true when a stale reconcile should not re-run the restore command.
 func skipRestoringIfPhaseAdvanced(
@@ -221,8 +208,9 @@ func skipRestoringIfPhaseAdvanced(
 	vmfr *restorev1alpha1.VirtualMachineFileRestore,
 ) (bool, error) {
 	logger := log.FromContext(ctx)
-	reader, usingCache := reconcilerAPIReader(r)
-	if usingCache {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
 		logger.Info("APIReader not configured; using cached client to check restore phase")
 	}
 	latest := &restorev1alpha1.VirtualMachineFileRestore{}
@@ -231,7 +219,7 @@ func skipRestoringIfPhaseAdvanced(
 		logger.Error(err, "Failed to fetch latest VirtualMachineFileRestore before restore command", "key", key)
 		return false, NewTransientError(fmt.Sprintf("failed to fetch latest VirtualMachineFileRestore %s before restore command: %v", key, err))
 	}
-	if isRestoringPhaseCurrent(latest.Status.Phase) {
+	if latest.Status.Phase == restorev1alpha1.RestorePhaseRestoring {
 		return false, nil
 	}
 	logger.Info(

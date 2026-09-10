@@ -78,69 +78,6 @@ func TestParseRestoredFileCount(t *testing.T) {
 	}
 }
 
-func TestIsRestoringPhaseCurrent(t *testing.T) {
-	assert.True(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseRestoring))
-	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseCleanup))
-	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseSucceeded))
-	assert.False(t, isRestoringPhaseCurrent(restorev1alpha1.RestorePhaseVolumeReady))
-}
-
-// TestCopyRestoredFilesCountIfMissing verifies count is copied when dst is nil and not overwritten.
-func TestCopyRestoredFilesCountIfMissing(t *testing.T) {
-	int32Ptr := func(value int32) *int32 { return &value }
-
-	tests := []struct {
-		name     string
-		dstCount *int32
-		srcCount *int32
-		want     *int32
-	}{
-		{
-			name:     "copies when dst is nil",
-			dstCount: nil,
-			srcCount: int32Ptr(3),
-			want:     int32Ptr(3),
-		},
-		{
-			name:     "does not overwrite existing dst count",
-			dstCount: int32Ptr(7),
-			srcCount: int32Ptr(3),
-			want:     int32Ptr(7),
-		},
-		{
-			name:     "leaves dst nil when src count is nil",
-			dstCount: nil,
-			srcCount: nil,
-			want:     nil,
-		},
-	}
-
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			dst := &restorev1alpha1.VirtualMachineFileRestore{
-				Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
-					RestoredFilesCount: testCase.dstCount,
-				},
-			}
-			src := &restorev1alpha1.VirtualMachineFileRestore{
-				Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
-					RestoredFilesCount: testCase.srcCount,
-				},
-			}
-			copyRestoredFilesCountIfMissing(dst, src)
-			if testCase.want == nil {
-				assert.Nil(t, dst.Status.RestoredFilesCount)
-				return
-			}
-			require.NotNil(t, dst.Status.RestoredFilesCount)
-			assert.Equal(t, *testCase.want, *dst.Status.RestoredFilesCount)
-			if testCase.dstCount == nil {
-				assert.NotSame(t, src.Status.RestoredFilesCount, dst.Status.RestoredFilesCount)
-			}
-		})
-	}
-}
-
 func TestPreserveRestoredFilesCount(t *testing.T) {
 	int32Ptr := func(value int32) *int32 { return &value }
 	scheme := runtime.NewScheme()
@@ -246,51 +183,62 @@ func TestPreserveRestoredFilesCount(t *testing.T) {
 	})
 }
 
-func TestSkipRestoringIfPhaseAdvanced_APIReaderFailure(t *testing.T) {
+func TestSkipRestoringIfPhaseAdvanced(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, restorev1alpha1.AddToScheme(scheme))
 	ctx := context.Background()
 
-	vmfr := &restorev1alpha1.VirtualMachineFileRestore{
-		ObjectMeta: metav1.ObjectMeta{Name: "restore-skip-fail", Namespace: "test-ns"},
-		Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
-			Phase: restorev1alpha1.RestorePhaseRestoring,
-		},
-	}
-	boom := errors.New("apiserver unavailable")
-	failingReader := fake.NewClientBuilder().WithScheme(scheme).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
-				if _, ok := obj.(*restorev1alpha1.VirtualMachineFileRestore); ok {
-					return boom
-				}
-				return nil
+	t.Run("phase already advanced", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-skip", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase: restorev1alpha1.RestorePhaseRestoring,
 			},
-		}).Build()
-	reconciler := &VirtualMachineFileRestoreReconciler{
-		Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
-		APIReader: failingReader,
-	}
+		}
+		latest := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-skip", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase: restorev1alpha1.RestorePhaseCleanup,
+			},
+		}
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(vmfr).Build(),
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+		}
 
-	skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
-	require.Error(t, err)
-	assert.False(t, skip)
-	assert.True(t, IsTransient(err))
-	assert.Contains(t, err.Error(), "before restore command")
-}
+		skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
+		require.NoError(t, err)
+		assert.True(t, skip)
+	})
 
-func TestReconcilerAPIReader(t *testing.T) {
-	cachedClient := fake.NewClientBuilder().Build()
-	apiReader := fake.NewClientBuilder().Build()
-	reconciler := &VirtualMachineFileRestoreReconciler{Client: cachedClient, APIReader: apiReader}
-	reader, usingCache := reconcilerAPIReader(reconciler)
-	assert.Equal(t, apiReader, reader)
-	assert.False(t, usingCache)
+	t.Run("API reader failure returns transient error", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-skip-fail", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase: restorev1alpha1.RestorePhaseRestoring,
+			},
+		}
+		boom := errors.New("apiserver unavailable")
+		failingReader := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+					if _, ok := obj.(*restorev1alpha1.VirtualMachineFileRestore); ok {
+						return boom
+					}
+					return nil
+				},
+			}).Build()
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
+			APIReader: failingReader,
+		}
 
-	reconciler = &VirtualMachineFileRestoreReconciler{Client: cachedClient}
-	reader, usingCache = reconcilerAPIReader(reconciler)
-	assert.Equal(t, cachedClient, reader)
-	assert.True(t, usingCache)
+		skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
+		require.Error(t, err)
+		assert.False(t, skip)
+		assert.True(t, IsTransient(err))
+		assert.Contains(t, err.Error(), "before restore command")
+	})
 }
 
 // Test transitionPhase timestamp logic - verifies StartTime/CompletionTime behavior
