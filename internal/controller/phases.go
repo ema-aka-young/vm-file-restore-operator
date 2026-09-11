@@ -223,6 +223,18 @@ func skipRestoringIfPhaseAdvanced(
 		return false, NewTransientError(fmt.Sprintf("failed to fetch latest VirtualMachineFileRestore %s before restore command: %v", key, err))
 	}
 	if latest.Status.Phase == restorev1alpha1.RestorePhaseRestoring {
+		if latest.Status.RestoredFilesCount != nil {
+			logger.Info(
+				"Restore command already completed; finishing cleanup transition",
+				"cachedPhase", vmfr.Status.Phase,
+				"filesRestored", *latest.Status.RestoredFilesCount,
+			)
+			if err := completeRestoringCleanupFromPersistedCount(ctx, r, vmfr, latest); err != nil {
+				logger.Error(err, "Failed to complete cleanup transition from persisted file count")
+				return false, err
+			}
+			return true, nil
+		}
 		return false, nil
 	}
 	logger.Info(
@@ -231,6 +243,26 @@ func skipRestoringIfPhaseAdvanced(
 		"apiPhase", latest.Status.Phase,
 	)
 	return true, nil
+}
+
+// completeRestoringCleanupFromPersistedCount patches phase to Cleanup when a prior reconcile
+// persisted restoredFilesCount but the phase transition patch failed.
+func completeRestoringCleanupFromPersistedCount(
+	ctx context.Context,
+	r *VirtualMachineFileRestoreReconciler,
+	vmfr *restorev1alpha1.VirtualMachineFileRestore,
+	latest *restorev1alpha1.VirtualMachineFileRestore,
+) error {
+	count := *latest.Status.RestoredFilesCount
+	patch := client.MergeFrom(vmfr.DeepCopy())
+	vmfr.Status.RestoredFilesCount = &count
+	vmfr.Status.Phase = restorev1alpha1.RestorePhaseCleanup
+	if err := r.Status().Patch(ctx, vmfr, patch); err != nil {
+		return err
+	}
+	eventMsg := fmt.Sprintf("Restored %d files, cleaning up", count)
+	r.Recorder.Event(vmfr, corev1.EventTypeNormal, string(restorev1alpha1.RestorePhaseCleanup), eventMsg)
+	return nil
 }
 
 // failRestore transitions the restore to Failed phase with error details.
@@ -673,7 +705,6 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 	var nextPhase restorev1alpha1.RestorePhase
 	var eventMsg string
 
-	// Update file count and transition phase atomically (issue #9)
 	patch := client.MergeFrom(vmfr.DeepCopy())
 
 	if vmfr.Spec.SourcePath == "" {
@@ -682,24 +713,33 @@ func handleRestoringPhase(ctx context.Context, r *VirtualMachineFileRestoreRecon
 		nextPhase = restorev1alpha1.RestorePhaseVolumeReady
 		eventMsg = "Volume mounted at " + vmfr.Status.MountPath + ", ready for manual restore"
 		logger.Info("Manual mode: transitioning to VolumeReady")
+		vmfr.Status.Phase = nextPhase
+		if err := r.Status().Patch(ctx, vmfr, patch); err != nil {
+			logger.Error(err, "Failed to update status during phase transition", "targetPhase", nextPhase)
+			return ctrl.Result{}, err
+		}
 	} else {
-		// Automatic mode: parse file count and transition to Cleanup
+		// Automatic mode: persist file count before phase so a failed phase patch cannot
+		// cause the restore command to be re-run on retry (issue #9).
 		fileCount := ParseRestoredFileCount(stdout)
 		if fileCount < 0 {
 			logger.Info("WARNING: guest helper did not emit a file count line; reporting 0")
 			fileCount = 0
 		}
 		vmfr.Status.RestoredFilesCount = &fileCount
+		if err := r.Status().Patch(ctx, vmfr, patch); err != nil {
+			logger.Error(err, "Failed to persist restoredFilesCount after restore command", "filesRestored", fileCount)
+			return ctrl.Result{}, err
+		}
 		nextPhase = restorev1alpha1.RestorePhaseCleanup
 		eventMsg = fmt.Sprintf("Restored %d files, cleaning up", fileCount)
 		logger.Info("Automatic mode: transitioning to Cleanup", "filesRestored", fileCount)
-	}
-
-	vmfr.Status.Phase = nextPhase
-
-	if err := r.Status().Patch(ctx, vmfr, patch); err != nil {
-		logger.Error(err, "Failed to update status during phase transition", "targetPhase", nextPhase)
-		return ctrl.Result{}, err
+		patch = client.MergeFrom(vmfr.DeepCopy())
+		vmfr.Status.Phase = nextPhase
+		if err := r.Status().Patch(ctx, vmfr, patch); err != nil {
+			logger.Error(err, "Failed to update status during phase transition", "targetPhase", nextPhase)
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Log transition and emit event

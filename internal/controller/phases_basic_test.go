@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	v1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -209,6 +210,43 @@ func TestSkipRestoringIfPhaseAdvanced(t *testing.T) {
 		skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
 		require.NoError(t, err)
 		assert.True(t, skip)
+	})
+
+	t.Run("persisted file count completes cleanup without SSH", func(t *testing.T) {
+		int32Ptr := func(value int32) *int32 { return &value }
+		latest := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-count", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase:              restorev1alpha1.RestorePhaseRestoring,
+				RestoredFilesCount: int32Ptr(3),
+			},
+		}
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-count", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase: restorev1alpha1.RestorePhaseRestoring,
+			},
+		}
+		k8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(latest).
+			WithStatusSubresource(&restorev1alpha1.VirtualMachineFileRestore{}).
+			Build()
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    k8sClient,
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(latest).Build(),
+			Recorder:  record.NewFakeRecorder(16),
+		}
+
+		skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
+		require.NoError(t, err)
+		assert.True(t, skip)
+
+		updated := &restorev1alpha1.VirtualMachineFileRestore{}
+		require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(vmfr), updated))
+		assert.Equal(t, restorev1alpha1.RestorePhaseCleanup, updated.Status.Phase)
+		require.NotNil(t, updated.Status.RestoredFilesCount)
+		assert.Equal(t, int32(3), *updated.Status.RestoredFilesCount)
 	})
 
 	t.Run("CR not found skips restore", func(t *testing.T) {
