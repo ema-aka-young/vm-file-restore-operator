@@ -216,6 +216,9 @@ func skipRestoringIfPhaseAdvanced(
 	latest := &restorev1alpha1.VirtualMachineFileRestore{}
 	key := client.ObjectKeyFromObject(vmfr)
 	if err := reader.Get(ctx, key, latest); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
 		logger.Error(err, "Failed to fetch latest VirtualMachineFileRestore before restore command", "key", key)
 		return false, NewTransientError(fmt.Sprintf("failed to fetch latest VirtualMachineFileRestore %s before restore command: %v", key, err))
 	}

@@ -211,6 +211,23 @@ func TestSkipRestoringIfPhaseAdvanced(t *testing.T) {
 		assert.True(t, skip)
 	})
 
+	t.Run("CR not found skips restore", func(t *testing.T) {
+		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-skip-gone", Namespace: "test-ns"},
+			Status: restorev1alpha1.VirtualMachineFileRestoreStatus{
+				Phase: restorev1alpha1.RestorePhaseRestoring,
+			},
+		}
+		reconciler := &VirtualMachineFileRestoreReconciler{
+			Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(vmfr).Build(),
+			APIReader: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		}
+
+		skip, err := skipRestoringIfPhaseAdvanced(ctx, reconciler, vmfr)
+		require.NoError(t, err)
+		assert.True(t, skip)
+	})
+
 	t.Run("API reader failure returns transient error", func(t *testing.T) {
 		vmfr := &restorev1alpha1.VirtualMachineFileRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: "restore-skip-fail", Namespace: "test-ns"},
