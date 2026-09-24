@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,11 +34,13 @@ import (
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
@@ -50,10 +53,11 @@ import (
 )
 
 const (
-	vmName           = "fedora-file-restore-test"
-	bootDiskName     = "fedora-boot-dv"
-	bootDiskSize     = "10Gi"
-	kubevirtAPIGroup = "kubevirt.io"
+	vmName            = "fedora-file-restore-test"
+	bootDiskName      = "fedora-boot-dv"
+	bootDiskSize      = "10Gi"
+	kubevirtAPIGroup  = "kubevirt.io"
+	k8sAnnotationTrue = "true"
 )
 
 func kubevirtAPIGroupPtr() *string {
@@ -75,7 +79,7 @@ type TestEnv struct {
 	K8sClient      *kubernetes.Clientset
 	VirtClient     kubecli.KubevirtClient
 	SnapshotClient snapshotclientset.Interface
-	CRClient       client.Client
+	CRClient       client.WithWatch
 	Namespace      string
 	PrivateKeyPath string
 }
@@ -212,7 +216,7 @@ func vmiStatusDetail(vmi *kubevirtv1.VirtualMachineInstance) string {
 
 // initClients creates and returns Kubernetes, KubeVirt, snapshot, and controller-runtime clients
 func initClients() (
-	*kubernetes.Clientset, kubecli.KubevirtClient, snapshotclientset.Interface, client.Client, error,
+	*kubernetes.Clientset, kubecli.KubevirtClient, snapshotclientset.Interface, client.WithWatch, error,
 ) {
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
@@ -258,7 +262,7 @@ func initClients() (
 	}
 
 	// Create controller-runtime client for typed access to our CRs
-	crClient, err := client.New(config, client.Options{Scheme: scheme})
+	crClient, err := client.NewWithWatch(config, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to create controller-runtime client: %w", err)
 	}
@@ -516,7 +520,8 @@ func createVolumeSnapshot(
 	if snapshotClassName == nil {
 		for i := range snapshotClasses.Items {
 			sc := &snapshotClasses.Items[i]
-			if sc.Annotations != nil && sc.Annotations["snapshot.storage.kubernetes.io/is-default-class"] == "true" {
+			if sc.Annotations != nil &&
+				sc.Annotations["snapshot.storage.kubernetes.io/is-default-class"] == k8sAnnotationTrue {
 				snapshotClassName = &sc.Name
 				break
 			}
@@ -692,7 +697,7 @@ func waitForRestorePhase(
 	return restore
 }
 
-// waitForRestoreFailed waits until the restore CR reaches Failed with a non-empty error message.
+// waitForRestoreFailed waits until the restore CR reaches Failed with non-empty failure details.
 func waitForRestoreFailed(
 	crClient client.Client, ns, name string, timeout time.Duration,
 ) *filerestorev1alpha1.VirtualMachineFileRestore {
@@ -706,7 +711,7 @@ func waitForRestoreFailed(
 		}
 		g.Expect(restore.Status.Phase).To(gomega.Equal(filerestorev1alpha1.RestorePhaseFailed),
 			fmt.Sprintf("Restore phase is %s", restore.Status.Phase))
-		g.Expect(restore.Status.ErrorMessage).NotTo(gomega.BeEmpty(), "Expected non-empty errorMessage")
+		g.Expect(restoreFailureText(restore)).NotTo(gomega.BeEmpty(), "Expected non-empty failure details")
 	}, timeout, 10*time.Second).Should(gomega.Succeed())
 	return restore
 }
@@ -720,6 +725,9 @@ func restoreVolumeName(restoreCRName string) string {
 func vmiHasRestoreVolume(virtClient kubecli.KubevirtClient, namespace, vmiName, restoreCRName string) (bool, error) {
 	vmi, err := virtClient.VirtualMachineInstance(namespace).Get(context.Background(), vmiName, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	want := restoreVolumeName(restoreCRName)
@@ -756,7 +764,7 @@ func assertNoManagedRestoreDataVolume(crClient client.Client, namespace, restore
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
 }
 
-// assertSuccessfulRestoreCleanup checks temporary resources are removed after Succeeded (TS-009).
+// assertSuccessfulRestoreCleanup checks temporary resources are removed after Succeeded.
 func assertSuccessfulRestoreCleanup(
 	virtClient kubecli.KubevirtClient,
 	crClient client.Client,
@@ -949,4 +957,714 @@ func deleteFileRestoreIfExists(env *TestEnv, name string) {
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
 	// Ensure the hotplugged volume is detached before the next test runs on the shared VM.
 	assertRestoreVolumeDetached(env.VirtClient, env.Namespace, vmName, name)
+}
+
+const (
+	dummySSHPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG1vY2tlZGtleWZvcnRlc3Rzbm90b3BlcmF0b3I=" +
+		" vmfr-e2e-dummy-key"
+)
+
+// ensureRestoreTestUser creates the standard restore test user on the guest if absent.
+func ensureRestoreTestUser(env *TestEnv) {
+	_, err := runSSHCommand(vmName, env.Namespace,
+		fmt.Sprintf("id %s &>/dev/null || useradd -m -s /bin/bash %s", testUser, testUser), env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to ensure restore test user on guest")
+}
+
+// waitForGuestFile polls until path exists on the guest (replaces fixed sleeps after write+sync).
+func waitForGuestFile(env *TestEnv, filePath string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		_, err := runSSHCommand(vmName, env.Namespace,
+			fmt.Sprintf("test -f %s", shellEscape(filePath)), env.PrivateKeyPath)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "file %s not visible on guest yet", filePath)
+	}, 30*time.Second, 2*time.Second).Should(gomega.Succeed())
+}
+
+// snapshotBootDisk creates a VolumeSnapshot of the VM boot disk and waits until it is ready.
+func snapshotBootDisk(env *TestEnv, snapName string) {
+	err := createVolumeSnapshot(env.SnapshotClient, env.K8sClient, env.Namespace, bootDiskName, snapName)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create boot disk VolumeSnapshot")
+	waitForVolumeSnapshotReady(env.SnapshotClient, env.Namespace, snapName)
+}
+
+// prepareBootDiskRestoreSnapshot writes test data on the boot disk, snapshots it, and removes the
+// live file so a subsequent restore CR must recreate it from the snapshot.
+func prepareBootDiskRestoreSnapshot(env *TestEnv, snapName, dataPath, dataFile, content string) {
+	ensureRestoreTestUser(env)
+	_, err := runSSHCommand(vmName, env.Namespace,
+		fmt.Sprintf("mkdir -p %s && echo %s > %s && sync",
+			shellEscape(dataPath), shellEscape(content), shellEscape(dataFile)), env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to write test data on guest")
+	waitForGuestFile(env, dataFile)
+	snapshotBootDisk(env, snapName)
+	_, err = runSSHCommand(vmName, env.Namespace, fmt.Sprintf("rm -f %s", shellEscape(dataFile)), env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to delete live test file before restore")
+}
+
+// expectedRestorePhaseOrder is the complete persisted status sequence for automatic restore.
+var expectedRestorePhaseOrder = []filerestorev1alpha1.RestorePhase{
+	filerestorev1alpha1.RestorePhaseHotplugging,
+	filerestorev1alpha1.RestorePhaseWaitingForAttachment,
+	filerestorev1alpha1.RestorePhaseSSHConnecting,
+	filerestorev1alpha1.RestorePhaseRestoring,
+	filerestorev1alpha1.RestorePhaseCleanup,
+	filerestorev1alpha1.RestorePhaseSucceeded,
+}
+
+// phaseWatcher records restore phase transitions until a terminal phase is reached.
+type phaseWatcher struct {
+	mu     sync.Mutex
+	phases []filerestorev1alpha1.RestorePhase
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (w *phaseWatcher) snapshot() []filerestorev1alpha1.RestorePhase {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]filerestorev1alpha1.RestorePhase, len(w.phases))
+	copy(out, w.phases)
+	return out
+}
+
+func (w *phaseWatcher) close() {
+	w.cancel()
+	gomega.Eventually(w.done, 30*time.Second).Should(gomega.BeClosed())
+}
+
+func (w *phaseWatcher) waitForCompletion() {
+	gomega.Eventually(w.done, 30*time.Second).Should(gomega.BeClosed(),
+		"phase watch did not observe a terminal restore phase")
+}
+
+// startRestorePhaseWatcher watches the restore CR and records every persisted phase transition.
+func startRestorePhaseWatcher(crClient client.WithWatch, ns, name string) *phaseWatcher {
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := crClient.Watch(ctx, &filerestorev1alpha1.VirtualMachineFileRestoreList{},
+		client.InNamespace(ns), client.MatchingFields{"metadata.name": name})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to watch restore phases")
+
+	w := &phaseWatcher{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	go func() {
+		defer close(w.done)
+		var last filerestorev1alpha1.RestorePhase
+		for event := range stream.ResultChan() {
+			restore, ok := event.Object.(*filerestorev1alpha1.VirtualMachineFileRestore)
+			if !ok || restore.Name != name || restore.Status.Phase == "" {
+				continue
+			}
+			phase := restore.Status.Phase
+			if phase != last {
+				w.mu.Lock()
+				w.phases = append(w.phases, phase)
+				w.mu.Unlock()
+				last = phase
+			}
+			if phase == filerestorev1alpha1.RestorePhaseSucceeded ||
+				phase == filerestorev1alpha1.RestorePhaseFailed {
+				return
+			}
+		}
+	}()
+	return w
+}
+
+// assertErrorMessageContains checks restore failure details contain all substrings (case-insensitive).
+func assertErrorMessageContains(restore *filerestorev1alpha1.VirtualMachineFileRestore, substrings ...string) {
+	msg := restoreFailureText(restore)
+	gomega.Expect(msg).NotTo(gomega.BeEmpty(), "expected non-empty restore failure details")
+	for _, want := range substrings {
+		gomega.Expect(msg).To(gomega.ContainSubstring(strings.ToLower(want)),
+			"restore failure details should contain %q (errorMessage=%q)", want, restore.Status.ErrorMessage)
+	}
+}
+
+func assertErrorMessageContainsAny(restore *filerestorev1alpha1.VirtualMachineFileRestore, substrings ...string) {
+	msg := restoreFailureText(restore)
+	matchers := make([]gomega.OmegaMatcher, len(substrings))
+	for i, substring := range substrings {
+		matchers[i] = gomega.ContainSubstring(strings.ToLower(substring))
+	}
+	gomega.Expect(msg).To(gomega.SatisfyAny(matchers...),
+		"restore failure details should contain one of %q", substrings)
+}
+
+// restoreFailureText returns lowercase errorMessage and condition messages for negative-path assertions.
+func restoreFailureText(restore *filerestorev1alpha1.VirtualMachineFileRestore) string {
+	var parts []string
+	if restore.Status.ErrorMessage != "" {
+		parts = append(parts, strings.ToLower(restore.Status.ErrorMessage))
+	}
+	for _, cond := range restore.Status.Conditions {
+		if cond.Message != "" {
+			parts = append(parts, strings.ToLower(cond.Message))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func assertExpectedRestorePhases(observed []filerestorev1alpha1.RestorePhase) {
+	gomega.Expect(observed).To(gomega.Equal(expectedRestorePhaseOrder),
+		"restore should progress through every expected phase in order")
+}
+
+func getOperatorSSHResources(k8sClient *kubernetes.Clientset) (string, []byte) {
+	cm, err := k8sClient.CoreV1().ConfigMaps(operatorNamespace()).Get(
+		context.Background(), operatorSSHConfigMapName(), metav1.GetOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get operator SSH ConfigMap")
+	pubKey := strings.TrimSpace(cm.Data["ssh-publickey"])
+	gomega.Expect(pubKey).NotTo(gomega.BeEmpty(), "Operator SSH public key is empty")
+	linuxTar := cm.BinaryData["linux-helpers.tar"]
+	gomega.Expect(linuxTar).NotTo(gomega.BeEmpty(), "linux-helpers.tar not found in operator ConfigMap")
+	return pubKey, linuxTar
+}
+
+// installGuestHelperWithoutOperatorKey installs filerestore user + helper with a dummy SSH key.
+// Call on a VM from setupTestVMWithoutGuestHelper so the operator key is never installed.
+func installGuestHelperWithoutOperatorKey(env *TestEnv) {
+	_, linuxTar := getOperatorSSHResources(env.K8sClient)
+	gomega.Eventually(func(g gomega.Gomega) {
+		err := installGuestHelper(vmName, env.Namespace, dummySSHPublicKey, linuxTar, env.PrivateKeyPath)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Guest helper installation failed")
+	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+// removeFilerestoreHelperBinary deletes the guest helper script.
+// setupTestVM already installs the helper; this test only needs the binary absent.
+func removeFilerestoreHelperBinary(env *TestEnv) {
+	_, err := runSSHCommand(vmName, env.Namespace, "rm -f /usr/local/bin/filerestore.sh", env.PrivateKeyPath)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to remove filerestore.sh")
+}
+
+// stopVM halts the target VM and waits for the VMI to disappear.
+func stopVM(virtClient kubecli.KubevirtClient, namespace, name string) {
+	halted := kubevirtv1.RunStrategyHalted
+	patch := []byte(fmt.Sprintf(`{"spec":{"runStrategy":"%s"}}`, halted))
+	_, err := virtClient.VirtualMachine(namespace).Patch(
+		context.Background(), name, "application/merge-patch+json", patch, metav1.PatchOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to halt VM")
+	gomega.Eventually(func(g gomega.Gomega) {
+		_, err := virtClient.VirtualMachineInstance(namespace).Get(
+			context.Background(), name, metav1.GetOptions{},
+		)
+		g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "VMI still exists after halt")
+	}, 5*time.Minute, 10*time.Second).Should(gomega.Succeed())
+}
+
+// fillDiskNearlyFull preallocates one file while leaving approximately reserveBytes available.
+// Use it with the dedicated ext4 test filesystem, where fallocate has deterministic accounting.
+func fillDiskNearlyFull(vmiName, namespace, path string, reserveBytes int64, identityFile string) {
+	fillBytes := filesystemFreeBytes(vmiName, namespace, path, identityFile) - reserveBytes
+	gomega.Expect(fillBytes).To(gomega.BeNumerically(">", 0),
+		"filesystem %s does not have more than %d bytes available", path, reserveBytes)
+
+	fillerPath := filepath.Join(path, ".e2e-fill")
+	command := fmt.Sprintf("fallocate -l %d %s && sync", fillBytes, shellEscape(fillerPath))
+	_, err := runSSHCommandWithTimeout(vmiName, namespace, command, identityFile, 10*time.Minute)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to fill disk")
+}
+
+func filesystemFreeBytes(vmiName, namespace, path, identityFile string) int64 {
+	cmd := fmt.Sprintf(`df -P %s | tail -1 | awk '{print $4}'`, shellEscape(path))
+	out, err := runSSHCommand(vmiName, namespace, cmd, identityFile)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to read free space on %s", path)
+	availKB, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Invalid df output: %q", out)
+	return availKB * 1024
+}
+
+// assertFilesystemFreeBelow asserts the filesystem containing path has less than maxFreeBytes available.
+func assertFilesystemFreeBelow(vmiName, namespace, path string, maxFreeBytes int64, identityFile string) {
+	availBytes := filesystemFreeBytes(vmiName, namespace, path, identityFile)
+	gomega.Expect(availBytes).To(gomega.BeNumerically("<", maxFreeBytes),
+		"expected less than %d bytes free on %s, got %d", maxFreeBytes, path, availBytes)
+}
+
+// interruptGuestRestoreWhileRunning runs action once after the restore CR enters Restoring.
+// Register before createFileRestoreCR; action must not use gomega (runs in a goroutine).
+func interruptGuestRestoreWhileRunning(
+	crClient client.WithWatch, ns, restoreName string,
+	timeout time.Duration,
+	action func() error,
+) <-chan error {
+	result := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	stream, err := crClient.Watch(ctx, &filerestorev1alpha1.VirtualMachineFileRestoreList{},
+		client.InNamespace(ns), client.MatchingFields{"metadata.name": restoreName})
+	if err != nil {
+		cancel()
+		result <- fmt.Errorf("watch restore %s: %w", restoreName, err)
+		close(result)
+		return result
+	}
+
+	go func() {
+		defer close(result)
+		defer cancel()
+		defer stream.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				result <- fmt.Errorf("restore did not reach Restoring within %s", timeout)
+				return
+			case event, ok := <-stream.ResultChan():
+				if !ok {
+					result <- fmt.Errorf("restore watch closed before %s reached Restoring", restoreName)
+					return
+				}
+				restore, ok := event.Object.(*filerestorev1alpha1.VirtualMachineFileRestore)
+				if !ok || restore.Name != restoreName {
+					continue
+				}
+				switch restore.Status.Phase {
+				case filerestorev1alpha1.RestorePhaseFailed, filerestorev1alpha1.RestorePhaseSucceeded:
+					result <- fmt.Errorf("restore reached terminal phase %s before interruption", restore.Status.Phase)
+					return
+				case filerestorev1alpha1.RestorePhaseRestoring:
+					result <- action()
+					return
+				}
+			}
+		}
+	}()
+	return result
+}
+
+// interruptSourceBackupDuringRestore freezes the transfer while hot-unplugging its source volume.
+func interruptSourceBackupDuringRestore(
+	virtClient kubecli.KubevirtClient, namespace, vmName, restoreName, identityFile string,
+) error {
+	pauseCmd := "for i in $(seq 1 100); do " +
+		"pid=$(pgrep -f '/usr/local/bin/[f]ilerestore.sh' | head -n1); " +
+		"if [ -n \"$pid\" ]; then " +
+		"pgid=$(ps -o pgid= -p \"$pid\" | tr -d ' '); " +
+		"kill -STOP -- -\"$pgid\"; echo \"$pgid\"; exit 0; fi; " +
+		"sleep 0.05; done; exit 1"
+	processGroup, err := runSSHCommand(vmName, namespace, pauseCmd, identityFile)
+	if err != nil {
+		return fmt.Errorf("pause guest restore: %w", err)
+	}
+	processGroupID, err := strconv.Atoi(strings.TrimSpace(processGroup))
+	if err != nil {
+		return fmt.Errorf("parse guest restore process group %q: %w", processGroup, err)
+	}
+	resume := func() error {
+		_, err := runSSHCommand(vmName, namespace, fmt.Sprintf("kill -CONT -- -%d || true", processGroupID), identityFile)
+		return err
+	}
+
+	volumeName := restoreVolumeName(restoreName)
+	if err := removeVolumeFromVM(virtClient, namespace, vmName, volumeName); err != nil {
+		_ = resume()
+		return err
+	}
+	if err := waitForVMIVolumeDetached(virtClient, namespace, vmName, volumeName, 2*time.Minute); err != nil {
+		_ = resume()
+		return err
+	}
+	return resume()
+}
+
+// Block mode matches snapshot-derived backup volumes and hotplugs reliably; an unformatted filesystem-mode
+// PVC often never reaches VolumeReady and surfaces only as "volume attachment timeout".
+func createBlankBackupPVC(k8sClient *kubernetes.Clientset, namespace, pvcName, size string) {
+	scName := defaultStorageClassName(k8sClient)
+	blockMode := corev1.PersistentVolumeBlock
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeMode:  &blockMode,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(size),
+				},
+			},
+			StorageClassName: scName,
+		},
+	}
+	_, err := k8sClient.CoreV1().PersistentVolumeClaims(namespace).Create(
+		context.Background(), pvc, metav1.CreateOptions{},
+	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create blank backup PVC")
+	gomega.Eventually(func(g gomega.Gomega) {
+		current, err := k8sClient.CoreV1().PersistentVolumeClaims(namespace).Get(
+			context.Background(), pvcName, metav1.GetOptions{},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(current.Status.Phase).To(gomega.Equal(corev1.ClaimBound))
+	}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
+}
+
+func defaultStorageClassName(k8sClient *kubernetes.Clientset) *string {
+	scs, err := k8sClient.StorageV1().StorageClasses().List(context.Background(), metav1.ListOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	for _, sc := range scs.Items {
+		if sc.Annotations != nil &&
+			sc.Annotations["storageclass.kubernetes.io/is-default-class"] == k8sAnnotationTrue {
+			return &sc.Name
+		}
+	}
+	if len(scs.Items) > 0 {
+		return &scs.Items[0].Name
+	}
+	return nil
+}
+
+// removeVolumeFromVM rebuilds VM spec without the named volume/disk and updates the VM.
+func removeVolumeFromVM(virtClient kubecli.KubevirtClient, namespace, vmName, volumeName string) error {
+	vm, err := virtClient.VirtualMachine(namespace).Get(context.Background(), vmName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	newVolumes := make([]kubevirtv1.Volume, 0, len(vm.Spec.Template.Spec.Volumes))
+	for _, v := range vm.Spec.Template.Spec.Volumes {
+		if v.Name != volumeName {
+			newVolumes = append(newVolumes, v)
+		}
+	}
+	newDisks := make([]kubevirtv1.Disk, 0, len(vm.Spec.Template.Spec.Domain.Devices.Disks))
+	for _, d := range vm.Spec.Template.Spec.Domain.Devices.Disks {
+		if d.Name != volumeName {
+			newDisks = append(newDisks, d)
+		}
+	}
+	vm.Spec.Template.Spec.Volumes = newVolumes
+	vm.Spec.Template.Spec.Domain.Devices.Disks = newDisks
+	_, err = virtClient.VirtualMachine(namespace).Update(context.Background(), vm, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("update VM after removing volume %s: %w", volumeName, err)
+	}
+	return nil
+}
+
+// hotplugPVCToVM adds a PVC-backed SCSI disk to a running VM.
+func hotplugPVCToVM(
+	virtClient kubecli.KubevirtClient, namespace, vmName, volumeName, pvcName string,
+) error {
+	vm, err := virtClient.VirtualMachine(namespace).Get(context.Background(), vmName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, kubevirtv1.Volume{
+		Name: volumeName,
+		VolumeSource: kubevirtv1.VolumeSource{
+			PersistentVolumeClaim: &kubevirtv1.PersistentVolumeClaimVolumeSource{
+				PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvcName,
+				},
+				Hotpluggable: true,
+			},
+		},
+	})
+	vm.Spec.Template.Spec.Domain.Devices.Disks = append(vm.Spec.Template.Spec.Domain.Devices.Disks, kubevirtv1.Disk{
+		Name: volumeName,
+		DiskDevice: kubevirtv1.DiskDevice{
+			Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusSCSI},
+		},
+		Serial: volumeName,
+	})
+
+	_, err = virtClient.VirtualMachine(namespace).Update(
+		context.Background(), vm, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("hotplug PVC %s as volume %s: %w", pvcName, volumeName, err)
+	}
+	return nil
+}
+
+// waitForVMIVolumeDetached waits until a hotplugged volume disappears from VMI status.
+func waitForVMIVolumeDetached(
+	virtClient kubecli.KubevirtClient, namespace, vmiName, volumeName string, timeout time.Duration,
+) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		vmi, err := virtClient.VirtualMachineInstance(namespace).Get(
+			context.Background(), vmiName, metav1.GetOptions{},
+		)
+		if err != nil {
+			return err
+		}
+
+		attached := false
+		for _, status := range vmi.Status.VolumeStatus {
+			if status.Name == volumeName {
+				attached = true
+				break
+			}
+		}
+		if !attached {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("volume %s remained attached to VMI %s/%s", volumeName, namespace, vmiName)
+}
+
+// rbacTestFixtures holds service accounts and scoped clients for RBAC tests.
+type rbacTestFixtures struct {
+	Namespace string
+	Admin     client.Client
+	Editor    client.Client
+	Viewer    client.Client
+	None      client.Client
+	cleanup   []func()
+}
+
+func (r *rbacTestFixtures) deferCleanup() {
+	for i := len(r.cleanup) - 1; i >= 0; i-- {
+		r.cleanup[i]()
+	}
+}
+
+// setupRBACTestFixtures creates SAs, bindings, and token-scoped API clients in namespace.
+func setupRBACTestFixtures(env *TestEnv) *rbacTestFixtures {
+	applyVMFileRestoreClusterRoles()
+	fix := &rbacTestFixtures{Namespace: env.Namespace}
+	roles := map[string]string{
+		"vmfr-admin":  "virtualmachinefilerestore-admin-role",
+		"vmfr-editor": "virtualmachinefilerestore-editor-role",
+		"vmfr-viewer": "virtualmachinefilerestore-viewer-role",
+		"vmfr-none":   "",
+	}
+	for saName, clusterRole := range roles {
+		sa := &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: saName, Namespace: env.Namespace},
+		}
+		_, err := env.K8sClient.CoreV1().ServiceAccounts(env.Namespace).Create(
+			context.Background(), sa, metav1.CreateOptions{},
+		)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "create SA %s", saName)
+		fix.cleanup = append(fix.cleanup, func() {
+			_ = env.K8sClient.CoreV1().ServiceAccounts(env.Namespace).Delete(
+				context.Background(), saName, metav1.DeleteOptions{},
+			)
+		})
+		if clusterRole != "" {
+			rb := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName + "-binding",
+					Namespace: env.Namespace,
+				},
+				Subjects: []rbacv1.Subject{{
+					Kind:      rbacv1.ServiceAccountKind,
+					Name:      saName,
+					Namespace: env.Namespace,
+				}},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: rbacv1.GroupName,
+					Kind:     "ClusterRole",
+					Name:     clusterRole,
+				},
+			}
+			_, err = env.K8sClient.RbacV1().RoleBindings(env.Namespace).Create(
+				context.Background(), rb, metav1.CreateOptions{},
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "create RoleBinding for %s", saName)
+			fix.cleanup = append(fix.cleanup, func() {
+				_ = env.K8sClient.RbacV1().RoleBindings(env.Namespace).Delete(
+					context.Background(), saName+"-binding", metav1.DeleteOptions{},
+				)
+			})
+		}
+	}
+
+	tokenAdmin, err := serviceAccountToken(env.Namespace, "vmfr-admin")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	tokenEditor, err := serviceAccountToken(env.Namespace, "vmfr-editor")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	tokenViewer, err := serviceAccountToken(env.Namespace, "vmfr-viewer")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	tokenNone, err := serviceAccountToken(env.Namespace, "vmfr-none")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	fix.Admin = newCRClientWithToken(tokenAdmin)
+	fix.Editor = newCRClientWithToken(tokenEditor)
+	fix.Viewer = newCRClientWithToken(tokenViewer)
+	fix.None = newCRClientWithToken(tokenNone)
+	return fix
+}
+
+func newCRClientWithToken(token string) client.Client {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	gomega.Expect(kubeconfig).NotTo(gomega.BeEmpty())
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	cfg = rest.CopyConfig(cfg)
+	cfg.BearerToken = token
+	cfg.BearerTokenFile = ""
+	cfg.CertData = nil
+	cfg.KeyData = nil
+	cfg.CertFile = ""
+	cfg.KeyFile = ""
+	cfg.ExecProvider = nil
+	cfg.AuthProvider = nil
+	cfg.Impersonate = rest.ImpersonationConfig{}
+
+	scheme := runtime.NewScheme()
+	gomega.Expect(filerestorev1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+	gomega.Expect(corev1.AddToScheme(scheme)).To(gomega.Succeed())
+
+	crClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	return crClient
+}
+
+// sampleRestoreCR returns a minimal VMFileRestore for RBAC permission probes.
+func sampleRestoreCR(namespace, name, targetVM string) *filerestorev1alpha1.VirtualMachineFileRestore {
+	return &filerestorev1alpha1.VirtualMachineFileRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: filerestorev1alpha1.VirtualMachineFileRestoreSpec{
+			Target: corev1.TypedLocalObjectReference{
+				APIGroup: kubevirtAPIGroupPtr(),
+				Kind:     "VirtualMachine",
+				Name:     targetVM,
+			},
+			Source: filerestorev1alpha1.RestoreSource{
+				PVC: &filerestorev1alpha1.PVCSource{Name: "placeholder-pvc"},
+			},
+			SourcePath: "/home/donald",
+		},
+	}
+}
+
+// formatDataDisk formats a blank virtio data disk and mounts it at mountPoint.
+func formatDataDisk(
+	vmiName, namespace, diskName, mountPoint, fstype, identityFile string,
+) {
+	device := waitForDataDiskDevice(vmiName, namespace, diskName, identityFile)
+	setupScript := fmt.Sprintf(`set -ex
+parted -s /dev/%s mklabel gpt
+parted -s /dev/%s mkpart primary 1MiB 100%%
+sleep 2
+partprobe /dev/%s
+sleep 2
+PART=$(lsblk -ln -o NAME /dev/%s | tail -1)
+mkfs.%s /dev/$PART
+mkdir -p %s
+mount /dev/$PART %s
+sync
+`, device, device, device, device, fstype, shellEscape(mountPoint), shellEscape(mountPoint))
+	_, err := runSSHCommandWithTimeout(vmiName, namespace, setupScript, identityFile, 5*time.Minute)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to format %s disk %s", fstype, diskName)
+}
+
+// waitForDataDiskDevice resolves the guest block device for a VM DataVolume name.
+func waitForDataDiskDevice(vmiName, namespace, diskName, identityFile string) string {
+	var device string
+	gomega.Eventually(func(g gomega.Gomega) {
+		dev, err := findDataDiskDevice(vmiName, namespace, diskName, identityFile)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to find data disk %s", diskName)
+		g.Expect(dev).NotTo(gomega.BeEmpty(), "Data disk %s not visible in guest", diskName)
+		device = dev
+	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+	return device
+}
+
+func findDataDiskDevice(vmiName, namespace, diskName, identityFile string) (string, error) {
+	output, err := runSSHCommand(vmiName, namespace,
+		"lsblk -d -n -o NAME,SERIAL,TYPE", identityFile)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] != "disk" || fields[0] == "" {
+			continue
+		}
+		if fields[1] == diskName {
+			return fields[0], nil
+		}
+	}
+	return findBlankNonVdaDataDisk(vmiName, namespace, identityFile, diskName)
+}
+
+// findBlankNonVdaDataDisk returns the first non-vda disk without a filesystem (single extra-disk VMs).
+func findBlankNonVdaDataDisk(vmiName, namespace, identityFile, diskName string) (string, error) {
+	output, err := runSSHCommand(vmiName, namespace,
+		"lsblk -d -n -o NAME,SIZE,TYPE | grep disk | grep -v vda", identityFile)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == "" {
+			continue
+		}
+		dev := fields[0]
+		checkOutput, checkErr := runSSHCommand(vmiName, namespace,
+			fmt.Sprintf("blkid /dev/%s 2>/dev/null; echo $?", dev), identityFile)
+		if checkErr != nil {
+			continue
+		}
+		if strings.TrimSpace(checkOutput) == "2" {
+			return dev, nil
+		}
+	}
+	return "", fmt.Errorf("no data disk found for %s (serial match and blank-disk fallback failed)", diskName)
+}
+
+func repoRoot() string {
+	out, err := exec.Command("go", "env", "GOMOD").Output()
+	if err != nil {
+		return "."
+	}
+	modPath := strings.TrimSpace(string(out))
+	if modPath == "" {
+		return "."
+	}
+	return filepath.Dir(modPath)
+}
+
+// assertFilerestoreSSHAuth verifies the operator SSH'd as filerestore during restore.
+func assertFilerestoreSSHAuth(
+	restore *filerestorev1alpha1.VirtualMachineFileRestore,
+	vmiName, namespace, identityFile string,
+) {
+	gomega.Expect(restore.Status.StartTime).NotTo(gomega.BeNil(), "restore startTime not set")
+	gomega.Expect(restore.Status.CompletionTime).NotTo(gomega.BeNil(), "restore completionTime not set")
+
+	since := restore.Status.StartTime.Unix()
+	until := restore.Status.CompletionTime.Unix()
+	journalCmd := "journalctl --since \"@%d\" --until \"@%d\" --no-pager 2>/dev/null | " +
+		"grep -i 'accepted publickey for filerestore' || true"
+	cmd := fmt.Sprintf(journalCmd, since, until)
+	out, err := runSSHCommand(vmiName, namespace, cmd, identityFile)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to read SSH auth log on guest")
+	gomega.Expect(strings.TrimSpace(out)).NotTo(gomega.BeEmpty(),
+		"SSH authentication log should show the operator connected as filerestore")
+}
+
+// createLargeFileOnVM creates a file of approximately sizeBytes at path.
+func createLargeFileOnVM(vmiName, namespace, path string, sizeBytes int64, identityFile string) {
+	cmd := fmt.Sprintf("fallocate -l %d %s 2>/dev/null || dd if=/dev/zero of=%s bs=1M count=%d status=none",
+		sizeBytes, shellEscape(path), shellEscape(path), sizeBytes/(1024*1024)+1)
+	_, err := runSSHCommandWithTimeout(vmiName, namespace, cmd, identityFile, 10*time.Minute)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to create large file at %s", path)
+	_, err = runSSHCommand(vmiName, namespace, "sync", identityFile)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+}
+
+// applyVMFileRestoreClusterRoles ensures user-facing ClusterRoles exist for RBAC e2e tests.
+func applyVMFileRestoreClusterRoles() {
+	root := repoRoot()
+	roles := []string{
+		"config/rbac/virtualmachinefilerestore_admin_role.yaml",
+		"config/rbac/virtualmachinefilerestore_editor_role.yaml",
+		"config/rbac/virtualmachinefilerestore_viewer_role.yaml",
+	}
+	for _, roleFile := range roles {
+		path := filepath.Join(root, roleFile)
+		cmd := exec.Command("kubectl", "apply", "-f", path)
+		out, err := cmd.CombinedOutput()
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "apply %s: %s", path, string(out))
+	}
 }

@@ -95,6 +95,36 @@ load 'test_helper'
     assert_output --partial "Unknown argument: --bogus"
 }
 
+# Command injection in --source-path must not execute shell metacharacters.
+setup_injection_sentinel() {
+    rm -f /tmp/injection-ran
+}
+
+@test "security: source-path with semicolon is passed literally" {
+    setup_injection_sentinel
+    setup_device_mock "ext4"
+    create_test_source_file "/data/file.txt"
+    run "$SCRIPT" restore --serial ABC123 --mount-path "$TEST_MOUNT_DIR" --source-path '/data/file.txt; touch /tmp/injection-ran'
+    # Restore may fail (path not found) but must not execute injected command
+    assert [ ! -f /tmp/injection-ran ]
+}
+
+@test "security: source-path with command substitution is passed literally" {
+    setup_injection_sentinel
+    setup_device_mock "ext4"
+    create_test_source_file "/data/file.txt"
+    run "$SCRIPT" restore --serial ABC123 --mount-path "$TEST_MOUNT_DIR" --source-path '/data/$(touch /tmp/injection-ran)'
+    assert [ ! -f /tmp/injection-ran ]
+}
+
+@test "security: source-path with backticks is passed literally" {
+    setup_injection_sentinel
+    setup_device_mock "ext4"
+    create_test_source_file "/data/file.txt"
+    run "$SCRIPT" restore --serial ABC123 --mount-path "$TEST_MOUNT_DIR" --source-path '/data/`touch /tmp/injection-ran`'
+    assert [ ! -f /tmp/injection-ran ]
+}
+
 @test "args: cleanup without --mount-path" {
     run "$SCRIPT" cleanup
     assert_failure
